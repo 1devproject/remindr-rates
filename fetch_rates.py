@@ -11,7 +11,8 @@ data = response.json()
 output = {
     "base": data["base_code"],
     "rates": data["conversion_rates"],
-    "updated": data["time_last_update_utc"]
+    "updated": data["time_last_update_utc"],
+    "next_update": data["time_next_update_utc"]
 }
 
 with open("rates.json", "w") as f:
