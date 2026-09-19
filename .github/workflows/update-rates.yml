@@ -2,8 +2,25 @@ name: Update exchange rates
 
 on:
   schedule:
-    - cron: '5 0 * * *'   # runs daily at midnight UTC
-  workflow_dispatch:        # lets you trigger it manually too
+    # Hourly at :20, not the top of the hour - gives the Google Sheet's own
+    # hourly GOOGLEFINANCE refresh a buffer before we scrape it, in case
+    # Google's refresh itself lags a few minutes past the hour.
+    #
+    # ExchangeRate-API is a separate, slower-moving source: it only updates
+    # once every 24h regardless of how often this runs, so the script's own
+    # 24h cache (see fetch_rates.py) keeps API calls to ~30/month even
+    # though this workflow fires every hour.
+    - cron: '20 * * * *'
+  workflow_dispatch:
+
+# Required so the action can commit rates.json back to the repo.
+permissions:
+  contents: write
+
+# If a run is still going when the next hour ticks, don't stack them.
+concurrency:
+  group: update-rates
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -22,6 +39,7 @@ jobs:
       - name: Fetch rates
         env:
           EXCHANGE_API_KEY: ${{ secrets.EXCHANGE_API_KEY }}
+          SHEET_CSV_URL: ${{ secrets.SHEET_CSV_URL }}
         run: python fetch_rates.py
 
       - name: Commit and push if changed
