@@ -76,17 +76,10 @@ def fetch_sheet_rates():
     """
     Parse the published sheet CSV.
 
-    Actual layout (confirmed against the live sheet):
-      - A few metadata rows first (last_updated, main_currency), then a blank
-        row, then the real header: CURRENCY, CURRENCY_CODE, COUNTRY,
-        COUNTRY_CODE, USD_VALUE, ... (USD_VALUE repeats in a later column).
-      - USD_VALUE is "1 unit of this currency, in USD" - the INVERSE of what
-        rates.json stores (which is "1 USD, in this currency"). Every sheet
-        value is inverted (1 / value) before use.
-
-    Columns are located by header name rather than fixed position, so this
-    keeps working if the sheet ever gains/reorders a column.
-    Anything unparseable is skipped rather than failing the run.
+    Returns the RAW USD_VALUE per currency code, un-inverted. Direction
+    (whether a given row needs inverting to match rates.json's convention)
+    is auto-detected per-currency in merge(), against the API baseline -
+    see the note there for why a single fixed direction doesn't work here.
     """
     if not SHEET_CSV_URL:
         print("No SHEET_CSV_URL set - skipping sheet source.")
@@ -104,18 +97,14 @@ def fetch_sheet_rates():
         print(f"WARNING: could not fetch sheet ({e}) - using API baseline only.")
         return {}
 
-    # Diagnostics: if this ever stops matching a real CSV, these lines make it
-    # obvious in the Action log rather than silently returning nothing.
     print(f"Sheet fetch: HTTP {r.status_code}, {len(r.text)} bytes, "
           f"content-type={r.headers.get('content-type')}")
-    if not r.text.strip().upper().startswith(("CURRENCY", "LAST_UPDATED")) and "CURRENCY_CODE" not in r.text.upper():
+    if "CURRENCY_CODE" not in r.text.upper():
         print("WARNING: response doesn't look like the expected CSV. First 200 chars:")
         print(repr(r.text[:200]))
 
     rows = list(csv.reader(io.StringIO(r.text)))
 
-    # Find the real header row (the one containing CURRENCY_CODE), skipping
-    # the last_updated / main_currency / blank rows above it.
     header_idx = None
     for i, row in enumerate(rows):
         if any(cell.strip().upper() == "CURRENCY_CODE" for cell in row):
@@ -129,12 +118,17 @@ def fetch_sheet_rates():
     header = [cell.strip().upper() for cell in rows[header_idx]]
     try:
         code_col = header.index("CURRENCY_CODE")
-        value_col = header.index("USD_VALUE")  # first occurrence, if duplicated
+        value_col = header.index("USD_VALUE")
     except ValueError:
         print("WARNING: expected columns missing from sheet header - skipping sheet source.")
         return {}
 
     out = {}
+    skipped_bad_code = []
+    skipped_no_value = []
+    skipped_unparseable = []
+    total_data_rows = 0
+
     for row in rows[header_idx + 1:]:
         if len(row) <= max(code_col, value_col):
             continue
@@ -142,58 +136,94 @@ def fetch_sheet_rates():
         code = row[code_col].strip().upper()
         raw = row[value_col].strip()
 
+        if not code:
+            continue  # trailing blank row at the end of the sheet, not real data
+
+        total_data_rows += 1
+
         if len(code) != 3 or not code.isalpha():
+            skipped_bad_code.append(code or "(blank)")
             continue
         if raw.lower() in BAD_VALUES:
+            skipped_no_value.append(code)
             continue
 
         try:
-            value_in_usd = float(raw.replace(",", ""))
+            value = float(raw.replace(",", ""))
         except ValueError:
+            skipped_unparseable.append(f"{code}={raw!r}")
             continue
-        if value_in_usd <= 0:
+        if value <= 0:
+            skipped_unparseable.append(f"{code}={raw!r} (non-positive)")
             continue
 
-        # Invert: sheet gives "1 CODE = X USD", we need "1 USD = X CODE".
-        out[code] = 1.0 / value_in_usd
+        out[code] = value  # raw, NOT inverted - direction decided in merge()
+
+    print(f"Sheet: {total_data_rows} data row(s), {len(out)} usable.")
+    if skipped_bad_code:
+        print(f"  {len(skipped_bad_code)} skipped (not a 3-letter code): {skipped_bad_code}")
+    if skipped_no_value:
+        print(f"  {len(skipped_no_value)} skipped (N/A or blank value): {skipped_no_value}")
+    if skipped_unparseable:
+        print(f"  {len(skipped_unparseable)} skipped (unparseable value): {skipped_unparseable}")
 
     return out
 
 
-def merge(api_rates, sheet_rates, prev_sources=None):
+def merge(api_rates, sheet_rates_raw, prev_sources=None):
     """
     API/baseline rates, with sane sheet values layered on top.
-    Entries not touched by this run's sheet keep whatever source label they
-    already had (so the output honestly reflects "sheet, 3 runs ago" style
-    provenance rather than being relabeled "api" just because it was reused).
+
+    The sheet is NOT internally consistent about direction: some rows give
+    "1 unit of currency, in USD" (needs inverting to match rates.json), and
+    others already give "1 USD, in that currency" (matches as-is) - almost
+    certainly because the underlying GOOGLEFINANCE formulas were set up in
+    different directions for different rows. A single fixed rule (always
+    invert, or never invert) is wrong for a large fraction of currencies
+    either way.
+
+    So for each currency, both interpretations (raw value, and its
+    reciprocal) are checked against the API baseline, and whichever one
+    actually lands close to a trusted reference is used. A currency is only
+    rejected if NEITHER direction is plausible.
     """
     rates = dict(api_rates)
     sources = dict(prev_sources) if prev_sources else {}
     applied = rejected = 0
 
-    for code, sheet_value in sheet_rates.items():
+    for code, raw_value in sheet_rates_raw.items():
         baseline = api_rates.get(code)
 
         if baseline is None:
-            # Currency the baseline doesn't cover at all - nothing to sanity check
-            # against, so take the sheet value as-is.
-            rates[code] = sheet_value
+            # No baseline to check direction against. Most of the sheet's
+            # rows turned out to already match rates.json's own convention
+            # directly (see the run that surfaced this), so that's the
+            # default here - but there's no way to be sure for a currency
+            # the API doesn't cover at all.
+            rates[code] = raw_value
             sources[code] = "sheet"
             applied += 1
             continue
 
-        drift = abs(sheet_value - baseline) / baseline
-        if drift > SANITY_TOLERANCE:
+        drift_as_is = abs(raw_value - baseline) / baseline
+        drift_inverted = abs((1.0 / raw_value) - baseline) / baseline if raw_value else float("inf")
+
+        if drift_as_is <= drift_inverted and drift_as_is <= SANITY_TOLERANCE:
+            rates[code] = raw_value
+            sources[code] = "sheet"
+            applied += 1
+        elif drift_inverted < drift_as_is and drift_inverted <= SANITY_TOLERANCE:
+            rates[code] = 1.0 / raw_value
+            sources[code] = "sheet"
+            applied += 1
+        else:
+            best_drift = min(drift_as_is, drift_inverted)
             print(
-                f"  rejected {code}: sheet={sheet_value} vs baseline={baseline} "
-                f"({drift:.1%} drift, over {SANITY_TOLERANCE:.0%} tolerance)"
+                f"  rejected {code}: sheet={raw_value} (as-is drift {drift_as_is:.1%}, "
+                f"inverted drift {drift_inverted:.1%}) vs baseline={baseline} "
+                f"- neither within {SANITY_TOLERANCE:.0%} tolerance"
             )
             rejected += 1
-            continue
-
-        rates[code] = sheet_value
-        sources[code] = "sheet"
-        applied += 1
 
     for code in rates:
         sources.setdefault(code, "api")
