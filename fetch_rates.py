@@ -93,12 +93,24 @@ def fetch_sheet_rates():
         return {}
 
     try:
-        r = requests.get(SHEET_CSV_URL, timeout=30)
+        r = requests.get(
+            SHEET_CSV_URL,
+            timeout=30,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; RemindrRatesBot/1.0)"},
+        )
         r.raise_for_status()
     except requests.RequestException as e:
         # A sheet outage must never break the build; we just fall back to the API.
         print(f"WARNING: could not fetch sheet ({e}) - using API baseline only.")
         return {}
+
+    # Diagnostics: if this ever stops matching a real CSV, these lines make it
+    # obvious in the Action log rather than silently returning nothing.
+    print(f"Sheet fetch: HTTP {r.status_code}, {len(r.text)} bytes, "
+          f"content-type={r.headers.get('content-type')}")
+    if not r.text.strip().upper().startswith(("CURRENCY", "LAST_UPDATED")) and "CURRENCY_CODE" not in r.text.upper():
+        print("WARNING: response doesn't look like the expected CSV. First 200 chars:")
+        print(repr(r.text[:200]))
 
     rows = list(csv.reader(io.StringIO(r.text)))
 
@@ -234,6 +246,9 @@ def main():
         f.write("\n")
 
     print(f"Wrote {len(rates)} rates to {OUT_FILE}.")
+    sheet_count = sum(1 for v in sources.values() if v == "sheet")
+    api_count = sum(1 for v in sources.values() if v == "api")
+    print(f"Source breakdown: {sheet_count} from sheet, {api_count} from api.")
 
 
 if __name__ == "__main__":
